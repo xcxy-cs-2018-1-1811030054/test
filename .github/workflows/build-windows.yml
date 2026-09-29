@@ -19,21 +19,35 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: 显示环境信息（排查用）
+        run: |
+          python --version
+          python -c "import sys; print('Executable:', sys.executable)"
+        shell: cmd
+
       - name: 安装 PyInstaller
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          python -m pip install pyinstaller
+        shell: cmd
 
       - name: 打包成单文件 EXE
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed ^
-            --name "视频去重工具" ^
-            video_dedup_gui.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name VideoDedup video_dedup_gui.py
+        shell: cmd
+
+      - name: 校验产物确实生成了
+        run: |
+          dir dist
+          if not exist "dist\VideoDedup.exe" (
+            echo [ERROR] exe was not generated!
+            exit /b 1
+          )
+          echo [OK] exe generated successfully
         shell: cmd
 
       - name: 上传 EXE
         uses: actions/upload-artifact@v4
         with:
-          name: 视频去重工具-windows
-          path: dist/视频去重工具.exe
-
+          name: VideoDedup-windows
+          path: dist/VideoDedup.exe
