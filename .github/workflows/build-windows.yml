@@ -1,1 +1,39 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: 打包成单文件 EXE
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed ^
+            --name "视频去重工具" ^
+            video_dedup_gui.py
+        shell: cmd
+
+      - name: 上传 EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: 视频去重工具-windows
+          path: dist/视频去重工具.exe
 
