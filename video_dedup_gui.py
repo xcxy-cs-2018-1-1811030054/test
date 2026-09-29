@@ -41,8 +41,9 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import (BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, IntVar,
+from tkinter import (BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, IntVar,
                      StringVar, Tk, filedialog, messagebox)
+from tkinter import font as tkfont
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -86,6 +87,210 @@ C_MUTED = "#6b7280"
 C_DANGER = "#dc2626"
 C_KEEP = "#059669"
 C_LINK = "#1d4ed8"
+
+
+# --------------------------------------------------------------------------- #
+# 自绘结果表格（Canvas）
+# --------------------------------------------------------------------------- #
+# 为什么不用 ttk.Treeview：它无法只给「某一列」设置字体，因此无法实现
+# 「仅路径列带下划线」。这里用 Canvas 手工绘制单元格，逐列控制字体与颜色。
+
+class ResultTable(ttk.Frame):
+    """自绘表格：支持每列独立字体/颜色、单击某列回调、悬停高亮、垂直滚动。"""
+
+    # 列定义：(键, 标题, 宽度, 对齐)
+    COLUMNS = [
+        ("group", "组", 48, "center"),
+        ("action", "处理", 70, "center"),
+        ("name", "文件名", 230, "w"),
+        ("quality", "清晰度", 140, "w"),
+        ("size", "大小", 85, "e"),
+        ("path", "路径（单击播放）", 400, "w"),
+    ]
+    HEADER_H = 30
+    ROW_H = 27
+    PAD = 8
+
+    def __init__(self, master, on_link_click=None, **kw):
+        super().__init__(master, **kw)
+        self.on_link_click = on_link_click      # 回调：点击「链接列」时触发
+        self.link_col_index = len(self.COLUMNS) - 1   # 路径列 = 最后一列
+
+        self.rows: list[dict] = []              # 每行数据
+        self.row_items: list[list[int]] = []    # 每行对应的 canvas item id
+        self.hover_row: int | None = None
+
+        # 字体：普通 / 下划线（仅用于路径列）
+        self.font_normal = tkfont.Font(family="Microsoft YaHei UI", size=9)
+        self.font_bold = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
+        self.font_link = tkfont.Font(family="Microsoft YaHei UI", size=9, underline=True)
+
+        # 画布 + 滚动条
+        self.canvas = Canvas(self, bg=C_CARD, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.vsb.pack(side=RIGHT, fill=Y)
+
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
+        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", self._on_leave)
+        self.canvas.bind("<Button-1>", self._on_click)
+
+    # ---------- 列宽 ---------- #
+    def _col_widths(self) -> list[int]:
+        widths = [c[2] for c in self.COLUMNS]
+        cw = self.canvas.winfo_width()
+        if cw > 10:
+            total = sum(widths)
+            extra = cw - total
+            if extra > 0:
+                # 多余宽度都给最后一列（路径）
+                widths[-1] += extra
+            else:
+                # 空间不足时按比例压缩
+                scale = cw / total
+                widths = [max(40, int(w * scale)) for w in widths]
+        return widths
+
+    def _col_x(self, widths: list[int]) -> list[int]:
+        xs, x = [], 0
+        for w in widths:
+            xs.append(x)
+            x += w
+        return xs
+
+    # ---------- 设置数据 ---------- #
+    def set_rows(self, rows: list[dict]):
+        """rows 每项：{'group','action','name','quality','size','path','is_keep'}"""
+        self.rows = rows
+        self._redraw()
+
+    def clear(self):
+        self.rows = []
+        self._redraw()
+
+    # ---------- 绘制 ---------- #
+    def _redraw(self):
+        cv = self.canvas
+        cv.delete("all")
+        self.row_items = []
+        widths = self._col_widths()
+        xs = self._col_x(widths)
+        cw = self.canvas.winfo_width() or sum(widths)
+
+        # 表头
+        cv.create_rectangle(0, 0, cw, self.HEADER_H, fill="#eef1f4", outline="")
+        for i, (key, title, w, anchor) in enumerate(self.COLUMNS):
+            tx, ta = self._anchor_xy(xs[i], widths[i], anchor)
+            cv.create_text(tx, self.HEADER_H // 2, text=title,
+                           font=self.font_bold, fill=C_TEXT, anchor=ta)
+            if i:
+                cv.create_line(xs[i], 0, xs[i], self.HEADER_H, fill="#d5d9de")
+
+        # 数据行
+        for ri, row in enumerate(self.rows):
+            y0 = self.HEADER_H + ri * self.ROW_H
+            y1 = y0 + self.ROW_H
+            is_keep = row.get("is_keep", False)
+            fg = C_KEEP if is_keep else C_DANGER
+            if ri % 2 == 1:
+                cv.create_rectangle(0, y0, cw, y1, fill="#fafbfc", outline="")
+
+            ids = []
+            for i, (key, _t, w, anchor) in enumerate(self.COLUMNS):
+                val = str(row.get(key, ""))
+                tx, ta = self._anchor_xy(xs[i], w, anchor)
+                # ★ 只有「路径列」用下划线字体（并显示为链接蓝）
+                if i == self.link_col_index:
+                    fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
+                                         font=self.font_link, fill=C_LINK, anchor=ta)
+                else:
+                    fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
+                                         font=self.font_normal, fill=fg, anchor=ta)
+                ids.append(fid)
+                if i:
+                    cv.create_line(xs[i], y0, xs[i], y1, fill="#eceff2")
+            self.row_items.append(ids)
+            cv.create_line(0, y1, cw, y1, fill="#eceff2")
+
+        # 滚动区域
+        total_h = self.HEADER_H + len(self.rows) * self.ROW_H
+        cv.configure(scrollregion=(0, 0, cw, max(total_h, 10)))
+        if self.hover_row is not None:
+            self._paint_hover(self.hover_row)
+
+    def _anchor_xy(self, x, w, anchor):
+        if anchor == "center":
+            return x + w // 2, "center"
+        if anchor == "e":
+            return x + w - self.PAD, "e"
+        return x + self.PAD, "w"
+
+    # ---------- 鼠标 ---------- #
+    def _row_at(self, y) -> int | None:
+        cy = self.canvas.canvasy(y)
+        idx = int((cy - self.HEADER_H) // self.ROW_H)
+        if 0 <= idx < len(self.rows):
+            return idx
+        return None
+
+    def _on_motion(self, event):
+        row = self._row_at(event.y)
+        if row != self.hover_row:
+            old = self.hover_row
+            self.hover_row = row
+            if old is not None:
+                self._unpaint_hover(old)
+            if row is not None:
+                self._paint_hover(row)
+
+    def _on_leave(self, _event):
+        if self.hover_row is not None:
+            self._unpaint_hover(self.hover_row)
+            self.hover_row = None
+
+    def _paint_hover(self, row: int):
+        """高亮该行的路径列（下划线更明显，提示可点击）。"""
+        try:
+            fid = self.row_items[row][self.link_col_index]
+            self.canvas.itemconfigure(fid, fill=C_PRIMARY)
+            # 补一条下划横线，强化链接感
+            widths = self._col_widths()
+            xs = self._col_x(widths)
+            y = self.HEADER_H + row * self.ROW_H + self.ROW_H - 6
+            line = self.canvas.create_line(
+                xs[self.link_col_index] + self.PAD, y,
+                xs[self.link_col_index] + widths[self.link_col_index] - self.PAD, y,
+                fill=C_PRIMARY, width=2, tags=f"hoverline{row}")
+        except IndexError:
+            pass
+
+    def _unpaint_hover(self, row: int):
+        try:
+            fid = self.row_items[row][self.link_col_index]
+            self.canvas.itemconfigure(fid, fill=C_LINK)
+            self.canvas.delete(f"hoverline{row}")
+        except IndexError:
+            pass
+
+    def _on_click(self, event):
+        """单击：若点在路径列，则触发回调。"""
+        row = self._row_at(event.y)
+        if row is None:
+            return
+        widths = self._col_widths()
+        xs = self._col_x(widths)
+        li = self.link_col_index
+        if xs[li] <= event.x <= xs[li] + widths[li]:
+            if self.on_link_click:
+                self.on_link_click(self.rows[row], row)
+
+    def _on_wheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
 # --------------------------------------------------------------------------- #
@@ -223,39 +428,143 @@ def _sharpness(frame) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def analyze_video(path: Path) -> dict | None:
+def analyze_video(path: Path, dense: bool = False) -> dict | None:
     """
     对单个视频做帧级分析，返回：
-      { 'hashes': [int], 'width': W, 'height': H, 'sharpness': float }
+      { 'hashes': [int], 'width': W, 'height': H, 'sharpness': float,
+        'duration': 秒, 'n_frames': 抽帧数 }
     失败返回 None。
+
+    dense=True 时改用「密集抽帧」：顺序解码全片，每隔几帧抽一个指纹，
+    用于时间轴滑动对齐（修法B）。较慢但能对齐。
     """
     if not HAS_CV2:
         return None
     try:
+        if dense:
+            return _analyze_video_dense(path)
         frames, w, h = _sample_frames(path)
         if not frames:
             return None
         hashes = [_phash(fr) for fr in frames]
         sharp = float(np.mean([_sharpness(fr) for fr in frames]))
-        return {"hashes": hashes, "width": w, "height": h, "sharpness": sharp}
+        dur = _video_duration(path)
+        return {"hashes": hashes, "width": w, "height": h, "sharpness": sharp,
+                "duration": dur, "n_frames": len(hashes)}
     except Exception:                                    # noqa: BLE001
         return None
+
+
+def _video_duration(path: Path) -> float:
+    """读取视频时长（秒）。优先用 OpenCV，失败则回退 ffprobe。"""
+    try:
+        cap = cv2.VideoCapture(str(path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        cap.release()
+        if fps > 0 and total > 0:
+            return float(total / fps)
+    except Exception:                                    # noqa: BLE001
+        pass
+    return 0.0
+
+
+def _analyze_video_dense(path: Path, every: int = 5) -> dict | None:
+    """
+    密集抽帧：顺序解码全片，每 every 帧取一个 pHash。
+    返回指纹序列（供时间轴滑动对齐使用）。
+    """
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    hashes: list[int] = []
+    idx = 0
+    sharp_vals: list[float] = []
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        if idx % every == 0:
+            hashes.append(_phash(fr))
+            if len(sharp_vals) < 12:
+                sharp_vals.append(_sharpness(fr))
+        idx += 1
+    cap.release()
+    if not hashes:
+        return None
+    return {
+        "hashes": hashes, "width": w, "height": h,
+        "sharpness": float(np.mean(sharp_vals)) if sharp_vals else 0.0,
+        "duration": float(idx / fps) if fps else 0.0,
+        "n_frames": len(hashes),
+        "frame_step": every, "fps": fps,
+    }
 
 
 def hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+def _seq_distance(ha: list[int], hb: list[int], shift: int) -> float | None:
+    """
+    在给定偏移量下，比较两段指纹序列的平均汉明距离。
+    shift > 0 表示 b 相对 a 向后偏移（b 从 a 的第 shift 个指纹开始对齐）。
+    返回平均距离；重叠部分太短则返回 None。
+    """
+    n, m = len(ha), len(hb)
+    # 计算对齐后的重叠区间
+    a_start = max(0, shift)
+    b_start = max(0, -shift)
+    overlap = min(n - a_start, m - b_start)
+    if overlap < 4:                       # 重叠太短，不足以判断
+        return None
+    total = 0
+    for k in range(overlap):
+        total += hamming(ha[a_start + k], hb[b_start + k])
+    return total / overlap
+
+
 def frames_similar(ha: list[int], hb: list[int], threshold: int) -> bool:
-    """
-    多帧投票判定两个视频画面是否相同。
-    取两段哈希按序比较，平均汉明距离 <= threshold 即认为相同。
-    """
+    """按位置一一对应的朴素比较（旧行为，保留兼容）。"""
     n = min(len(ha), len(hb))
     if n == 0:
         return False
     dists = [hamming(ha[i], hb[i]) for i in range(n)]
     return (sum(dists) / n) <= threshold
+
+
+def frames_similar_aligned(ha: list[int], hb: list[int], threshold: int,
+                           max_shift_frac: float = 0.5) -> tuple[bool, int, float]:
+    """
+    时间轴滑动对齐比对（修法B）。
+    在 [-max_shift, +max_shift] 范围内滑动，寻找平均距离最小的对齐位置。
+    返回 (是否相同, 最佳偏移, 最佳平均距离)。
+
+    关键：只有「对齐后全程吻合」才算相同 —— 缺头/缺尾会导致
+    最佳对齐点仍无法让整体匹配，或重叠区过短，从而被判为不同。
+    """
+    n, m = len(ha), len(hb)
+    if n == 0 or m == 0:
+        return False, 0, 999.0
+    max_shift = int(max(n, m) * max_shift_frac)
+    best_shift, best_dist = 0, 999.0
+    for shift in range(-max_shift, max_shift + 1):
+        d = _seq_distance(ha, hb, shift)
+        if d is not None and d < best_dist:
+            best_dist, best_shift = d, shift
+    if best_dist > 998:
+        return False, 0, 999.0
+    return best_dist <= threshold, best_shift, best_dist
+
+
+def durations_differ(da: float, db: float, tolerance: float) -> bool:
+    """修法A：两段时长差是否超过允许的容差（秒）。任一未知则视为不差。"""
+    if da <= 0 or db <= 0:
+        return False
+    return abs(da - db) > tolerance
 
 
 # --------------------------------------------------------------------------- #
@@ -369,17 +678,33 @@ class DedupEngine:
 
     # ---------- 第二级：帧级 ---------- #
     def find_similar_by_frames(self, files: list[Path], threshold: int,
-                               info_map: dict) -> list[list[Path]]:
+                               info_map: dict, use_align: bool = False,
+                               duration_on: bool = False,
+                               duration_tol: float = 1.0) -> list[list[Path]]:
+        """
+        帧级画面查重。
+        use_align     —— 修法B：时间轴滑动对齐
+        duration_on   —— 修法A：时长校验（先按时长差过滤）
+        duration_tol  —— A 允许的时长差（秒）
+        """
         if not HAS_CV2:
             self.log("【第4层·画面】未安装 OpenCV，跳过帧级查重")
             return []
 
-        # 只分析视频文件（避免对非视频做无谓解码）
         targets = [f for f in files if f.suffix.lower() in VIDEO_EXTS]
-        self.log(f"【第4层·画面】对 {len(targets)} 个视频抽取 {FRAMES_PER_VIDEO} 帧做画面比对…")
+        mode_desc = []
+        if duration_on:
+            mode_desc.append(f"时长校验(容差{duration_tol}s)")
+        if use_align:
+            mode_desc.append("时间轴对齐")
+        self.log(f"【第4层·画面】对 {len(targets)} 个视频做画面比对"
+                 + (f"（{' + '.join(mode_desc)}）" if mode_desc else "（朴素逐帧）"))
+
+        # B 开启时用密集抽帧，否则用稀疏抽帧
+        dense = bool(use_align)
         total, done = len(targets), 0
         with ThreadPoolExecutor(max_workers=DEFAULT_WORKERS) as ex:
-            futures = {ex.submit(analyze_video, f): f for f in targets}
+            futures = {ex.submit(analyze_video, f, dense): f for f in targets}
             for fut in as_completed(futures):
                 if self.should_cancel():
                     return []
@@ -394,7 +719,6 @@ class DedupEngine:
         usable = [f for f in targets if str(f) in info_map]
         self.log(f"         成功分析 {len(usable)}/{len(targets)} 个视频")
 
-        # 两两比较（用并查集合并相似组）
         parent = {str(f): str(f) for f in usable}
 
         def find(x):
@@ -410,24 +734,40 @@ class DedupEngine:
 
         n = len(usable)
         pairs_checked = 0
+        skipped_by_duration = 0
         for i in range(n):
             if self.should_cancel():
                 return []
             fi = usable[i]
-            hi = info_map[str(fi)]["hashes"]
+            ii = info_map[str(fi)]
             for j in range(i + 1, n):
                 fj = usable[j]
-                # 已经是同一组就不用比了
                 if find(str(fi)) == find(str(fj)):
                     continue
-                hj = info_map[str(fj)]["hashes"]
+                ij = info_map[str(fj)]
                 pairs_checked += 1
-                if frames_similar(hi, hj, threshold):
-                    union(str(fi), str(fj))
-                    self.log(f"         画面相同 ⟶ 合并：{fi.name}  ⇄  {fj.name}")
+                # ---- 修法A：时长校验，先过滤 ----
+                if duration_on and durations_differ(
+                        ii.get("duration", 0.0), ij.get("duration", 0.0),
+                        duration_tol):
+                    skipped_by_duration += 1
+                    continue
+                # ---- 画面比对 ----
+                if use_align:
+                    same, shift, dist = frames_similar_aligned(
+                        ii["hashes"], ij["hashes"], threshold)
+                    if same:
+                        union(str(fi), str(fj))
+                        self.log(f"         画面相同(偏移{shift}, 距离{dist:.1f}) ⟶ "
+                                 f"{fi.name} ⇄ {fj.name}")
+                else:
+                    if frames_similar(ii["hashes"], ij["hashes"], threshold):
+                        union(str(fi), str(fj))
+                        self.log(f"         画面相同 ⟶ {fi.name} ⇄ {fj.name}")
             self.progress(i + 1, n, "画面比对")
 
-        self.log(f"         共比对 {pairs_checked} 对，完成画面查重")
+        self.log(f"         共比对 {pairs_checked} 对"
+                 + (f"，其中 {skipped_by_duration} 对因时长不符被排除" if duration_on else ""))
         merged: dict[str, list[Path]] = defaultdict(list)
         for f in usable:
             merged[find(str(f))].append(f)
@@ -485,6 +825,9 @@ class VideoDedupApp:
         self.keep = StringVar(value="quality")
         self.use_frame = BooleanVar(value=bool(HAS_CV2))
         self.threshold = IntVar(value=DEFAULT_PHASH_THRESHOLD)
+        self.dur_check = BooleanVar(value=True)          # 修法A：时长校验
+        self.dur_tol = StringVar(value="0.5")            # A 允许的秒数差
+        self.use_align = BooleanVar(value=False)         # 修法B：时间轴对齐
 
         self.msg_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -607,6 +950,27 @@ class VideoDedupApp:
             ttk.Label(frow, text="  （越小越严格，推荐 6~12）", style="Card.TLabel",
                       foreground=C_MUTED).pack(side=LEFT)
 
+        # ---- 高级选项：A/B 两个开关 ----
+        arow = ttk.Frame(c4, style="Card.TFrame")
+        arow.pack(fill=X, pady=(8, 0))
+        ttk.Checkbutton(
+            arow, text="A · 时长校验：两视频时长差超过",
+            variable=self.dur_check, style="Card.TCheckbutton",
+            state=("normal" if HAS_CV2 else "disabled")).pack(side=LEFT)
+        ttk.Entry(arow, textvariable=self.dur_tol, width=5,
+                  justify="center").pack(side=LEFT, padx=(4, 4))
+        ttk.Label(arow, text="秒则判为不同（防止「缺头/缺尾」被误判为同一视频）",
+                  style="Card.TLabel").pack(side=LEFT)
+
+        brow2 = ttk.Frame(c4, style="Card.TFrame")
+        brow2.pack(fill=X, pady=(6, 0))
+        ttk.Checkbutton(
+            brow2, text="B · 时间轴对齐：滑动搜索最佳对齐点，可识别「整体错位」但内容相同的视频",
+            variable=self.use_align, style="Card.TCheckbutton",
+            state=("normal" if HAS_CV2 else "disabled")).pack(side=LEFT)
+        ttk.Label(brow2, text="（更慢，需要密集解码）", style="Card.TLabel",
+                  foreground=C_MUTED).pack(side=LEFT, padx=(6, 0))
+
         # ---- 操作 ----
         brow = ttk.Frame(outer)
         brow.pack(fill=X, pady=(12, 0))
@@ -631,27 +995,9 @@ class VideoDedupApp:
 
         tab1 = ttk.Frame(nb, padding=8)
         nb.add(tab1, text="  扫描结果  ")
-        cols = ("group", "action", "name", "quality", "size", "path")
-        self.tree = ttk.Treeview(tab1, columns=cols, show="headings", height=14)
-        for c, (txt, w, anchor) in {
-            "group": ("组", 45, "center"),
-            "action": ("处理", 70, "center"),
-            "name": ("文件名", 220, "w"),
-            "quality": ("清晰度", 120, "w"),
-            "size": ("大小", 80, "e"),
-            "path": ("路径（单击播放）", 380, "w"),
-        }.items():
-            self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor=anchor, stretch=(c == "path"))
-        vsb = ttk.Scrollbar(tab1, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side=LEFT, fill=BOTH, expand=True)
-        vsb.pack(side=RIGHT, fill=Y)
-        self.tree.tag_configure("keep", foreground=C_KEEP)
-        self.tree.tag_configure("dup", foreground=C_DANGER)
-        # 单击路径列 → 播放
-        self.tree.bind("<Button-1>", self._on_tree_click)
-        self.tree.bind("<Double-1>", self._on_tree_dblclick)
+        # 自绘表格：仅「路径」列带下划线并可单击播放
+        self.table = ResultTable(tab1, on_link_click=self._on_path_click)
+        self.table.pack(fill=BOTH, expand=True)
 
         tab2 = ttk.Frame(nb, padding=8)
         nb.add(tab2, text="  运行日志  ")
@@ -680,38 +1026,12 @@ class VideoDedupApp:
     def progress(self, done, total, phase):
         self.msg_queue.put(("progress", (done, total, phase)))
 
-    def _on_tree_click(self, event):
-        """单击路径列 → 播放该视频。"""
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
+    def _on_path_click(self, row: dict, _row_index: int):
+        """单击「路径」列 → 用系统默认播放器播放该视频。"""
+        rel = row.get("path", "")
+        if not rel or not self.scan_root:
             return
-        col = self.tree.identify_column(event.x)
-        # 路径是第 6 列（#6）
-        if col != "#6":
-            return
-        row = self.tree.identify_row(event.y)
-        if not row:
-            return
-        vals = self.tree.item(row, "values")
-        if len(vals) < 6:
-            return
-        rel = vals[5]
-        if not self.scan_root:
-            return
-        target = (self.scan_root / rel)
-        ok, err = open_with_default_player(target)
-        if not ok:
-            messagebox.showwarning("无法播放", f"打不开文件：\n{target}\n\n{err}")
-
-    def _on_tree_dblclick(self, event):
-        """双击整行也可播放（更符合直觉）。"""
-        row = self.tree.identify_row(event.y)
-        if not row or not self.scan_root:
-            return
-        vals = self.tree.item(row, "values")
-        if len(vals) < 6:
-            return
-        target = self.scan_root / vals[5]
+        target = self.scan_root / rel
         ok, err = open_with_default_player(target)
         if not ok:
             messagebox.showwarning("无法播放", f"打不开文件：\n{target}\n\n{err}")
@@ -748,6 +1068,14 @@ class VideoDedupApp:
         self.btn_cancel.config(state="disabled")
         self.pbar["value"] = 0
 
+    def _dur_tol(self) -> float:
+        """读取 A 开关的允许时长差（秒），非法输入回退到 1.0。"""
+        try:
+            v = float(self.dur_tol.get())
+            return max(0.0, v)
+        except (ValueError, TypeError):
+            return 1.0
+
     def _quality_text(self, path: Path) -> str:
         info = self.info_map.get(str(path))
         if not info:
@@ -757,23 +1085,31 @@ class VideoDedupApp:
         return f"{w}×{h}  锐度{sharp:.0f}"
 
     def _render_groups(self, groups: list):
-        self.tree.delete(*self.tree.get_children())
         root = self.scan_root
+        rows: list[dict] = []
         for i, group in enumerate(groups, 1):
             keeper = choose_keeper(group, self.info_map, self.keep.get())
-            for p in sorted(group, key=lambda x: str(x).lower()):
+            # 组内排序：保留行排第一，其余按路径
+            others = sorted([p for p in group if p != keeper],
+                            key=lambda x: str(x).lower())
+            ordered = [keeper] + others
+            for p in ordered:
                 try:
                     size = human_size(p.stat().st_size)
                     rel = str(p.relative_to(root)) if root else str(p)
                 except (OSError, ValueError):
                     size, rel = "?", str(p)
                 is_keep = (p == keeper)
-                self.tree.insert(
-                    "", END,
-                    values=(i, "保留" if is_keep else "重复", p.name,
-                            self._quality_text(p), size, rel),
-                    tags=("keep",) if is_keep else ("dup",),
-                )
+                rows.append({
+                    "group": i,
+                    "action": "保留" if is_keep else "重复",
+                    "name": p.name,
+                    "quality": self._quality_text(p),
+                    "size": size,
+                    "path": rel,
+                    "is_keep": is_keep,
+                })
+        self.table.set_rows(rows)
 
     # ---------------- 扫描 ---------------- #
     def on_scan(self):
@@ -801,7 +1137,7 @@ class VideoDedupApp:
         self.btn_scan.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.log_box.delete("1.0", END)
-        self.tree.delete(*self.tree.get_children())
+        self.table.clear()
         self.summary.config(text="")
 
         self.worker = threading.Thread(target=self._run_scan, args=(root,), daemon=True)
@@ -820,8 +1156,13 @@ class VideoDedupApp:
                 "永久删除" if self.permanent.get() else "移动到 _duplicates/")
             self.log(f"递归：{'是' if self.recursive.get() else '否'}   "
                      f"模式：{mode}   保留规则：{self.keep.get()}")
-            self.log(f"画面查重：{'开启' if self.use_frame.get() else '关闭'}"
-                     + (f"（阈值 {self.threshold.get()}）" if self.use_frame.get() else ""))
+            frame_desc = f"画面查重：{'开启' if self.use_frame.get() else '关闭'}"
+            if self.use_frame.get():
+                frame_desc += f"（阈值 {self.threshold.get()}"
+                if self.dur_check.get():
+                    frame_desc += f" | A时长校验±{self._dur_tol()}s"
+                frame_desc += f" | B时间轴对齐{'开' if self.use_align.get() else '关'}）"
+            self.log(frame_desc)
             self.log("=" * 64)
 
             self.progress(0, 1, "枚举文件")
@@ -845,7 +1186,10 @@ class VideoDedupApp:
             frame_groups = []
             if self.use_frame.get():
                 frame_groups = engine.find_similar_by_frames(
-                    files, self.threshold.get(), self.info_map)
+                    files, self.threshold.get(), self.info_map,
+                    use_align=self.use_align.get(),
+                    duration_on=self.dur_check.get(),
+                    duration_tol=self._dur_tol())
                 if self.cancel_flag.is_set():
                     self.msg_queue.put(("done", "已停止，未做任何改动。"))
                     return
