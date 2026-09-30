@@ -96,7 +96,10 @@ C_LINK = "#1d4ed8"
 # 「仅路径列带下划线」。这里用 Canvas 手工绘制单元格，逐列控制字体与颜色。
 
 class ResultTable(ttk.Frame):
-    """自绘表格：支持每列独立字体/颜色、单击某列回调、悬停高亮、垂直滚动。"""
+    """自绘表格：支持每列独立字体/颜色、单击某列回调、悬停高亮、垂直滚动。
+
+    额外提供「操作」列的删除按钮：点击后触发 on_delete_click 回调。
+    """
 
     # 列定义：(键, 标题, 宽度, 对齐)
     COLUMNS = [
@@ -106,19 +109,29 @@ class ResultTable(ttk.Frame):
         ("quality", "清晰度", 140, "w"),
         ("size", "大小", 85, "e"),
         ("path", "路径（单击播放）", 400, "w"),
+        ("delete", "操作", 76, "center"),
     ]
     HEADER_H = 30
     ROW_H = 27
     PAD = 8
+    C_BTN_BORDER = "#dc2626"
+    C_BTN_BG = "#fef2f2"
+    C_BTN_BG_HOVER = "#dc2626"
+    C_DELETED = "#9ca3af"
 
-    def __init__(self, master, on_link_click=None, **kw):
+    def __init__(self, master, on_link_click=None, on_delete_click=None, **kw):
         super().__init__(master, **kw)
         self.on_link_click = on_link_click      # 回调：点击「链接列」时触发
-        self.link_col_index = len(self.COLUMNS) - 1   # 路径列 = 最后一列
+        self.on_delete_click = on_delete_click  # 回调：点击「删除」按钮时触发
+        # 按键定位各特殊列（避免依赖固定顺序）
+        self.link_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "path")
+        self.delete_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "delete")
 
         self.rows: list[dict] = []              # 每行数据
         self.row_items: list[list[int]] = []    # 每行对应的 canvas item id
+        self.delete_btns: list = []             # 每行的删除按钮 (rect_id,text_id,bx0,by0,bx1,by1) 或 None
         self.hover_row: int | None = None
+        self._hover_btn_row: int | None = None
 
         # 字体：普通 / 下划线（仅用于路径列）
         self.font_normal = tkfont.Font(family="Microsoft YaHei UI", size=9)
@@ -148,8 +161,8 @@ class ResultTable(ttk.Frame):
             total = sum(widths)
             extra = cw - total
             if extra > 0:
-                # 多余宽度都给最后一列（路径）
-                widths[-1] += extra
+                # 多余宽度给「路径」列（而非最后一列）
+                widths[self.link_col_index] += extra
             else:
                 # 空间不足时按比例压缩
                 scale = cw / total
@@ -178,6 +191,7 @@ class ResultTable(ttk.Frame):
         cv = self.canvas
         cv.delete("all")
         self.row_items = []
+        self.delete_btns = []
         widths = self._col_widths()
         xs = self._col_x(widths)
         cw = self.canvas.winfo_width() or sum(widths)
@@ -196,16 +210,22 @@ class ResultTable(ttk.Frame):
             y0 = self.HEADER_H + ri * self.ROW_H
             y1 = y0 + self.ROW_H
             is_keep = row.get("is_keep", False)
-            fg = C_KEEP if is_keep else C_DANGER
+            deleted = row.get("deleted", False)
+            if deleted:
+                fg = self.C_DELETED            # 已删除 → 整行置灰
+            else:
+                fg = C_KEEP if is_keep else C_DANGER
             if ri % 2 == 1:
                 cv.create_rectangle(0, y0, cw, y1, fill="#fafbfc", outline="")
 
             ids = []
             for i, (key, _t, w, anchor) in enumerate(self.COLUMNS):
+                if i == self.delete_col_index:
+                    continue                   # 操作列单独画按钮
                 val = str(row.get(key, ""))
                 tx, ta = self._anchor_xy(xs[i], w, anchor)
-                # ★ 只有「路径列」用下划线字体（并显示为链接蓝）
-                if i == self.link_col_index:
+                # ★ 只有「路径列」用下划线字体（并显示为链接蓝）；已删除行整体置灰
+                if i == self.link_col_index and not deleted:
                     fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
                                          font=self.font_link, fill=C_LINK, anchor=ta)
                 else:
@@ -216,6 +236,22 @@ class ResultTable(ttk.Frame):
                     cv.create_line(xs[i], y0, xs[i], y1, fill="#eceff2")
             self.row_items.append(ids)
             cv.create_line(0, y1, cw, y1, fill="#eceff2")
+
+            # ---- 操作列：删除按钮 ---- #
+            di = self.delete_col_index
+            bx0, bx1 = xs[di] + 10, xs[di] + widths[di] - 10
+            by0, by1 = y0 + 4, y1 - 4
+            if deleted:
+                cv.create_text((bx0 + bx1) // 2, (y0 + y1) // 2, text="已删除",
+                               font=self.font_normal, fill=self.C_DELETED)
+                self.delete_btns.append(None)
+            else:
+                rid = cv.create_rectangle(bx0, by0, bx1, by1,
+                                          outline=self.C_BTN_BORDER,
+                                          fill=self.C_BTN_BG, width=1)
+                tid = cv.create_text((bx0 + bx1) // 2, (y0 + y1) // 2, text="删除",
+                                     font=self.font_normal, fill=self.C_BTN_BORDER)
+                self.delete_btns.append((rid, tid, bx0, by0, bx1, by1))
 
         # 滚动区域
         total_h = self.HEADER_H + len(self.rows) * self.ROW_H
@@ -247,6 +283,41 @@ class ResultTable(ttk.Frame):
                 self._unpaint_hover(old)
             if row is not None:
                 self._paint_hover(row)
+        self._hover_button(event, row)
+
+    def _hover_button(self, event, row):
+        """删除按钮的悬停效果：变实心红 + 手型光标。"""
+        # 恢复上一个悬停按钮
+        if self._hover_btn_row is not None and self._hover_btn_row != row:
+            self._restore_btn(self._hover_btn_row)
+            self._hover_btn_row = None
+        if row is None:
+            self.canvas.config(cursor="")
+            return
+        db = self.delete_btns[row] if row < len(self.delete_btns) else None
+        over_btn = False
+        if db:
+            _rid, _tid, bx0, by0, bx1, by1 = db
+            cy = self.canvas.canvasy(event.y)
+            over_btn = (bx0 <= event.x <= bx1 and by0 <= cy <= by1)
+        # 路径列也用手型光标
+        widths = self._col_widths()
+        xs = self._col_x(widths)
+        li = self.link_col_index
+        over_link = xs[li] <= event.x <= xs[li] + widths[li]
+        if over_btn:
+            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG_HOVER)
+            self.canvas.itemconfigure(db[1], fill="white")
+            self._hover_btn_row = row
+            self.canvas.config(cursor="hand2")
+        else:
+            self.canvas.config(cursor="hand2" if over_link else "")
+
+    def _restore_btn(self, row):
+        db = self.delete_btns[row] if row < len(self.delete_btns) else None
+        if db:
+            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG)
+            self.canvas.itemconfigure(db[1], fill=self.C_BTN_BORDER)
 
     def _on_leave(self, _event):
         if self.hover_row is not None:
@@ -278,16 +349,28 @@ class ResultTable(ttk.Frame):
             pass
 
     def _on_click(self, event):
-        """单击：若点在路径列，则触发回调。"""
-        row = self._row_at(event.y)
-        if row is None:
+        """单击：点在路径列 → 播放；点在「删除」按钮 → 触发删除回调。"""
+        row_idx = self._row_at(event.y)
+        if row_idx is None:
             return
         widths = self._col_widths()
         xs = self._col_x(widths)
+
+        # 1) 删除按钮
+        db = self.delete_btns[row_idx] if row_idx < len(self.delete_btns) else None
+        if db:
+            _rid, _tid, bx0, by0, bx1, by1 = db
+            cy = self.canvas.canvasy(event.y)
+            if bx0 <= event.x <= bx1 and by0 <= cy <= by1:
+                if self.on_delete_click:
+                    self.on_delete_click(self.rows[row_idx], row_idx)
+                return
+
+        # 2) 路径链接
         li = self.link_col_index
         if xs[li] <= event.x <= xs[li] + widths[li]:
             if self.on_link_click:
-                self.on_link_click(self.rows[row], row)
+                self.on_link_click(self.rows[row_idx], row_idx)
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -980,7 +1063,7 @@ class VideoDedupApp:
         self.btn_cancel = ttk.Button(brow, text="停止", command=self.on_cancel,
                                      state="disabled")
         self.btn_cancel.pack(side=LEFT, padx=(10, 0), ipady=6)
-        ttk.Label(brow, text="  提示：结果中单击蓝色路径即可播放视频",
+        ttk.Label(brow, text="  提示：单击蓝色路径播放视频；点「删除」按钮立即删除该文件",
                   style="Muted.TLabel").pack(side=LEFT, padx=(12, 0))
 
         pframe = ttk.Frame(outer)
@@ -995,8 +1078,9 @@ class VideoDedupApp:
 
         tab1 = ttk.Frame(nb, padding=8)
         nb.add(tab1, text="  扫描结果  ")
-        # 自绘表格：仅「路径」列带下划线并可单击播放
-        self.table = ResultTable(tab1, on_link_click=self._on_path_click)
+        # 自绘表格：仅「路径」列带下划线并可单击播放；「操作」列删除按钮
+        self.table = ResultTable(tab1, on_link_click=self._on_path_click,
+                                 on_delete_click=self._on_delete_click)
         self.table.pack(fill=BOTH, expand=True)
 
         tab2 = ttk.Frame(nb, padding=8)
@@ -1035,6 +1119,39 @@ class VideoDedupApp:
         ok, err = open_with_default_player(target)
         if not ok:
             messagebox.showwarning("无法播放", f"打不开文件：\n{target}\n\n{err}")
+
+    def _on_delete_click(self, row: dict, _row_index: int):
+        """点击「删除」按钮 → 立即永久删除该行对应文件（无需确认）。"""
+        rel = row.get("path", "")
+        if not rel or not self.scan_root:
+            return
+        if row.get("deleted"):
+            return                                   # 已删除过的行不再处理
+        target = self.scan_root / rel
+
+        if not target.exists():
+            messagebox.showwarning("文件不存在",
+                                   f"文件已不存在（可能已被删除或移动）：\n{target}")
+            row["deleted"] = True
+            row["action"] = "已删除"
+            self.table.set_rows(self.table.rows)
+            return
+
+        try:
+            target.unlink()
+        except OSError as e:
+            messagebox.showerror(
+                "删除失败",
+                f"{e}\n\n提示：如果文件正被播放器占用，请先关闭播放器再试。")
+            return
+
+        was_keep = row.get("action") == "保留"
+        row["deleted"] = True
+        row["action"] = "已删除"
+        self.table.set_rows(self.table.rows)         # 重绘，行置灰
+        self.log(f"🗑 已删除：{target}")
+        if was_keep:
+            self.log("  ⚠ 被删除的是该组的保留文件，建议重新扫描以更新分组。")
 
     def _poll_queue(self):
         try:
