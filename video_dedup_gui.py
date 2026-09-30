@@ -62,7 +62,7 @@ except Exception:                                   # noqa: BLE001
 # --------------------------------------------------------------------------- #
 
 APP_NAME = "视频去重工具"
-APP_VERSION = "2.0"
+APP_VERSION = "2.5"
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -95,6 +95,16 @@ C_LINK = "#1d4ed8"
 # 为什么不用 ttk.Treeview：它无法只给「某一列」设置字体，因此无法实现
 # 「仅路径列带下划线」。这里用 Canvas 手工绘制单元格，逐列控制字体与颜色。
 
+
+def _round_rect(cv, x0, y0, x1, y1, r, **kw):
+    """在画布 cv 上画圆角矩形（平滑多边形近似），返回 item id。"""
+    r = max(1, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
+    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
+           x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+           x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
 class ResultTable(ttk.Frame):
     """自绘表格：支持每列独立字体/颜色、单击某列回调、悬停高亮、垂直滚动。
 
@@ -114,11 +124,14 @@ class ResultTable(ttk.Frame):
     HEADER_H = 30
     ROW_H = 27
     PAD = 8
-    # 删除按钮：柔和的浅红胶囊，悬停变实心红
-    C_BTN_BORDER = "#eeb0b0"
-    C_BTN_BG = "#fdf4f4"
-    C_BTN_FG = "#dc2626"
-    C_BTN_BG_HOVER = "#dc2626"
+    # 删除按钮：中性浅色圆角按钮 + 柔和投影；悬停变浅红提示「删除」
+    C_BTN_SHADOW = "#e2e7f0"
+    C_BTN_BG = "#fcfdff"
+    C_BTN_BORDER = "#dbe2ec"
+    C_BTN_FG = "#46536b"
+    C_BTN_BG_HOVER = "#fee2e2"
+    C_BTN_BORDER_HOVER = "#fca5a5"
+    C_BTN_FG_HOVER = "#dc2626"
     C_DELETED = "#9ca3af"
 
     def __init__(self, master, on_link_click=None, on_delete_click=None, **kw):
@@ -149,11 +162,30 @@ class ResultTable(ttk.Frame):
 
         self.canvas.bind("<Configure>", lambda e: self._redraw())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        self.canvas.bind("<Button-4>", lambda e: self._scroll_units(-1))
+        self.canvas.bind("<Button-5>", lambda e: self._scroll_units(1))
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Button-1>", self._on_click)
+
+    # ---------- 滚动守卫 ---------- #
+    # Tk 画布的怪癖：内容不满一屏时仍可滚出负偏移（视口跑到内容上方之外），
+    # 表格被整体压到下半部分，顶部留出一截空白且不会自愈。因此：
+    #   1) 内容不满一屏时直接忽略滚动；
+    #   2) 滚动后若视口顶跑到内容上方（canvasy(0) < 0），立即钳回顶部。
+    def _content_fits(self) -> bool:
+        total_h = self.HEADER_H + len(self.rows) * self.ROW_H
+        return total_h <= max(self.canvas.winfo_height(), 1)
+
+    def _scroll_units(self, n: int):
+        if self._content_fits():
+            return
+        self.canvas.yview_scroll(n, "units")
+        if self.canvas.canvasy(0) < 0:
+            self.canvas.yview_moveto(0)
+
+    def _on_wheel(self, event):
+        self._scroll_units(int(-1 * (event.delta / 120)))
 
     # ---------- 列宽 ---------- #
     def _col_widths(self) -> list[int]:
@@ -239,37 +271,35 @@ class ResultTable(ttk.Frame):
             self.row_items.append(ids)
             cv.create_line(0, y1, cw, y1, fill="#eceff2")
 
-            # ---- 操作列：删除按钮 ---- #
-            # 已删除行：不显示按钮、也不显示文字（整行置灰已足够表达）
+            # ---- 操作列：删除按钮（中性圆角钮 + 柔和投影）---- #
             di = self.delete_col_index
             if deleted:
                 self.delete_btns.append(None)
             else:
                 cx = xs[di] + widths[di] // 2
                 cy = (y0 + y1) // 2
-                bw, bh = 52, 19
+                bw, bh = 54, 21
                 bx0, bx1 = cx - bw // 2, cx + bw // 2
                 by0, by1 = cy - bh // 2, cy + bh // 2
-                # 胶囊按钮：先画圆角底，再在上面叠一个填充矩形遮住两侧直边
-                rid = cv.create_rectangle(bx0, by0, bx1, by1,
-                                          outline="", fill=self.C_BTN_BORDER)
-                cv.create_rectangle(bx0 + bh // 2, by0, bx1 - bh // 2, by1,
-                                    outline="", fill=self.C_BTN_BG,
-                                    tags=f"btnfill{ri}")
-                # 左右两端画成圆弧（内切圆），实现圆角效果
-                cv.create_arc(bx0, by0, bx0 + bh, by1,
-                              start=90, extent=180, style="pieslice",
-                              outline="", fill=self.C_BTN_BG, tags=f"btnfill{ri}")
-                cv.create_arc(bx1 - bh, by0, bx1, by1,
-                              start=270, extent=180, style="pieslice",
-                              outline="", fill=self.C_BTN_BG, tags=f"btnfill{ri}")
+                # 柔和投影：同形圆角矩形整体下移 2px，垫在按钮下层
+                _round_rect(cv, bx0, by0 + 2, bx1, by1 + 2, 10,
+                            outline="", fill=self.C_BTN_SHADOW)
+                # 按钮本体：圆角矩形（平滑多边形实现圆角）
+                rid = _round_rect(cv, bx0, by0, bx1, by1, 10,
+                                  outline=self.C_BTN_BORDER,
+                                  fill=self.C_BTN_BG, width=1)
                 tid = cv.create_text(cx, cy, text="删除",
                                      font=self.font_normal, fill=self.C_BTN_FG)
                 self.delete_btns.append((rid, tid, bx0, by0, bx1, by1))
 
+
         # 滚动区域
         total_h = self.HEADER_H + len(self.rows) * self.ROW_H
         cv.configure(scrollregion=(0, 0, cw, max(total_h, 10)))
+        # 内容不满一屏时强制回到顶部：Tk 画布允许负偏移，
+        # 若不清零，残留偏移会把表格整体压下去、顶部留白（本 bug 根源）
+        if self._content_fits():
+            cv.yview_moveto(0)
         if self.hover_row is not None:
             self._paint_hover(self.hover_row)
 
@@ -300,8 +330,7 @@ class ResultTable(ttk.Frame):
         self._hover_button(event, row)
 
     def _hover_button(self, event, row):
-        """删除按钮的悬停效果：变实心红 + 手型光标。"""
-        # 恢复上一个悬停按钮
+        """删除按钮悬停：浅红底提示「删除」+ 手型光标（已删除行除外）。"""
         if self._hover_btn_row is not None and self._hover_btn_row != row:
             self._restore_btn(self._hover_btn_row)
             self._hover_btn_row = None
@@ -314,29 +343,28 @@ class ResultTable(ttk.Frame):
             _rid, _tid, bx0, by0, bx1, by1 = db
             cy = self.canvas.canvasy(event.y)
             over_btn = (bx0 <= event.x <= bx1 and by0 <= cy <= by1)
-        # 路径列也用手型光标（已删除行除外）
-        widths = self._col_widths()
-        xs = self._col_x(widths)
-        li = self.link_col_index
-        row_deleted = bool(self.rows[row].get("deleted"))
-        over_link = (xs[li] <= event.x <= xs[li] + widths[li]) and not row_deleted
         if over_btn:
-            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG_HOVER)
-            self.canvas.itemconfigure(db[1], fill="white")
-            for iid in self.canvas.find_withtag(f"btnfill{row}"):
-                self.canvas.itemconfigure(iid, fill=self.C_BTN_BG_HOVER)
+            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG_HOVER,
+                                      outline=self.C_BTN_BORDER_HOVER)
+            self.canvas.itemconfigure(db[1], fill=self.C_BTN_FG_HOVER)
             self._hover_btn_row = row
             self.canvas.config(cursor="hand2")
         else:
+            # 路径列也用手型光标（已删除行除外）
+            widths = self._col_widths()
+            xs = self._col_x(widths)
+            li = self.link_col_index
+            row_deleted = bool(self.rows[row].get("deleted"))
+            over_link = (xs[li] <= event.x <= xs[li] + widths[li]
+                         and not row_deleted)
             self.canvas.config(cursor="hand2" if over_link else "")
 
     def _restore_btn(self, row):
         db = self.delete_btns[row] if row < len(self.delete_btns) else None
         if db:
-            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BORDER)
+            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG,
+                                      outline=self.C_BTN_BORDER)
             self.canvas.itemconfigure(db[1], fill=self.C_BTN_FG)
-            for iid in self.canvas.find_withtag(f"btnfill{row}"):
-                self.canvas.itemconfigure(iid, fill=self.C_BTN_BG)
 
     def _on_leave(self, _event):
         if self.hover_row is not None:
