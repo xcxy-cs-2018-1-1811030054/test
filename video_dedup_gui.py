@@ -240,19 +240,31 @@ class ResultTable(ttk.Frame):
             cv.create_line(0, y1, cw, y1, fill="#eceff2")
 
             # ---- 操作列：删除按钮 ---- #
+            # 已删除行：不显示按钮、也不显示文字（整行置灰已足够表达）
             di = self.delete_col_index
-            bx0, bx1 = xs[di] + 10, xs[di] + widths[di] - 10
-            by0, by1 = y0 + 4, y1 - 4
             if deleted:
-                cv.create_text((bx0 + bx1) // 2, (y0 + y1) // 2, text="已删除",
-                               font=self.font_normal, fill=self.C_DELETED)
                 self.delete_btns.append(None)
             else:
+                cx = xs[di] + widths[di] // 2
+                cy = (y0 + y1) // 2
+                bw, bh = 52, 19
+                bx0, bx1 = cx - bw // 2, cx + bw // 2
+                by0, by1 = cy - bh // 2, cy + bh // 2
+                # 胶囊按钮：先画圆角底，再在上面叠一个填充矩形遮住两侧直边
                 rid = cv.create_rectangle(bx0, by0, bx1, by1,
-                                          outline=self.C_BTN_BORDER,
-                                          fill=self.C_BTN_BG, width=1)
-                tid = cv.create_text((bx0 + bx1) // 2, (y0 + y1) // 2, text="删除",
-                                     font=self.font_normal, fill=self.C_BTN_BORDER)
+                                          outline="", fill=self.C_BTN_BORDER)
+                cv.create_rectangle(bx0 + bh // 2, by0, bx1 - bh // 2, by1,
+                                    outline="", fill=self.C_BTN_BG,
+                                    tags=f"btnfill{ri}")
+                # 左右两端画成圆弧（内切圆），实现圆角效果
+                cv.create_arc(bx0, by0, bx0 + bh, by1,
+                              start=90, extent=180, style="pieslice",
+                              outline="", fill=self.C_BTN_BG, tags=f"btnfill{ri}")
+                cv.create_arc(bx1 - bh, by0, bx1, by1,
+                              start=270, extent=180, style="pieslice",
+                              outline="", fill=self.C_BTN_BG, tags=f"btnfill{ri}")
+                tid = cv.create_text(cx, cy, text="删除",
+                                     font=self.font_normal, fill=self.C_BTN_FG)
                 self.delete_btns.append((rid, tid, bx0, by0, bx1, by1))
 
         # 滚动区域
@@ -302,14 +314,17 @@ class ResultTable(ttk.Frame):
             _rid, _tid, bx0, by0, bx1, by1 = db
             cy = self.canvas.canvasy(event.y)
             over_btn = (bx0 <= event.x <= bx1 and by0 <= cy <= by1)
-        # 路径列也用手型光标
+        # 路径列也用手型光标（已删除行除外）
         widths = self._col_widths()
         xs = self._col_x(widths)
         li = self.link_col_index
-        over_link = xs[li] <= event.x <= xs[li] + widths[li]
+        row_deleted = bool(self.rows[row].get("deleted"))
+        over_link = (xs[li] <= event.x <= xs[li] + widths[li]) and not row_deleted
         if over_btn:
             self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG_HOVER)
             self.canvas.itemconfigure(db[1], fill="white")
+            for iid in self.canvas.find_withtag(f"btnfill{row}"):
+                self.canvas.itemconfigure(iid, fill=self.C_BTN_BG_HOVER)
             self._hover_btn_row = row
             self.canvas.config(cursor="hand2")
         else:
@@ -318,8 +333,10 @@ class ResultTable(ttk.Frame):
     def _restore_btn(self, row):
         db = self.delete_btns[row] if row < len(self.delete_btns) else None
         if db:
-            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BG)
-            self.canvas.itemconfigure(db[1], fill=self.C_BTN_BORDER)
+            self.canvas.itemconfigure(db[0], fill=self.C_BTN_BORDER)
+            self.canvas.itemconfigure(db[1], fill=self.C_BTN_FG)
+            for iid in self.canvas.find_withtag(f"btnfill{row}"):
+                self.canvas.itemconfigure(iid, fill=self.C_BTN_BG)
 
     def _on_leave(self, _event):
         if self.hover_row is not None:
@@ -327,7 +344,9 @@ class ResultTable(ttk.Frame):
             self.hover_row = None
 
     def _paint_hover(self, row: int):
-        """高亮该行的路径列（下划线更明显，提示可点击）。"""
+        """高亮该行的路径列（下划线更明显，提示可点击）。已删除行不参与。"""
+        if self.rows[row].get("deleted"):
+            return
         try:
             fid = self.row_items[row][self.link_col_index]
             self.canvas.itemconfigure(fid, fill=C_PRIMARY)
@@ -345,7 +364,10 @@ class ResultTable(ttk.Frame):
     def _unpaint_hover(self, row: int):
         try:
             fid = self.row_items[row][self.link_col_index]
-            self.canvas.itemconfigure(fid, fill=C_LINK)
+            deleted = self.rows[row].get("deleted")
+            # 已删除行 → 恢复为灰色普通文本；正常行 → 恢复为链接蓝
+            self.canvas.itemconfigure(
+                fid, fill=self.C_DELETED if deleted else C_LINK)
             self.canvas.delete(f"hoverline{row}")
         except IndexError:
             pass
@@ -368,7 +390,9 @@ class ResultTable(ttk.Frame):
                     self.on_delete_click(self.rows[row_idx], row_idx)
                 return
 
-        # 2) 路径链接
+        # 2) 路径链接（已删除行不可点击播放）
+        if self.rows[row_idx].get("deleted"):
+            return
         li = self.link_col_index
         if xs[li] <= event.x <= xs[li] + widths[li]:
             if self.on_link_click:
