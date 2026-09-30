@@ -114,8 +114,10 @@ class ResultTable(ttk.Frame):
     HEADER_H = 30
     ROW_H = 27
     PAD = 8
-    C_BTN_BORDER = "#dc2626"
-    C_BTN_BG = "#fef2f2"
+    # 删除按钮：柔和的浅红胶囊，悬停变实心红
+    C_BTN_BORDER = "#eeb0b0"
+    C_BTN_BG = "#fdf4f4"
+    C_BTN_FG = "#dc2626"
     C_BTN_BG_HOVER = "#dc2626"
     C_DELETED = "#9ca3af"
 
