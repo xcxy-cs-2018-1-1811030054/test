@@ -43,7 +43,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import (BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, IntVar,
-                     StringVar, Tk, filedialog, messagebox)
+                     Label, StringVar, Tk, Toplevel, filedialog, messagebox)
 from tkinter import font as tkfont
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
@@ -63,7 +63,7 @@ except Exception:                                   # noqa: BLE001
 # --------------------------------------------------------------------------- #
 
 APP_NAME = "视频去重工具"
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -178,6 +178,10 @@ class ResultTable(ttk.Frame):
         self.delete_btns: list = []             # 每行的删除按钮 (rect_id,text_id,bx0,by0,bx1,by1) 或 None
         self.hover_row: int | None = None
         self._hover_btn_row: int | None = None
+        self.elided: list[dict] = []             # 每行被截断的单元格：{col: 完整文本}
+        self.tip_win = None                      # 悬浮提示窗（Toplevel）
+        self.tip_text = None                     # 提示窗内的 Label
+        self.tip_row = None                      # 当前提示对应的 (row, col)
 
         # 字体：普通 / 下划线（仅用于路径列）
         # 高 DPI：像素类尺寸随 UI_SCALE 放大（字体是点单位，由 tk scaling 处理）
@@ -217,6 +221,7 @@ class ResultTable(ttk.Frame):
         return total_h <= max(self.canvas.winfo_height(), 1)
 
     def _scroll_units(self, n: int):
+        self._hide_tip()
         if self._content_fits():
             return
         self.canvas.yview_scroll(n, "units")
@@ -265,6 +270,8 @@ class ResultTable(ttk.Frame):
         cv.delete("all")
         self.row_items = []
         self.delete_btns = []
+        self.elided = []
+        self._hide_tip()                          # 重绘时先收起旧提示
         widths = self._col_widths()
         xs = self._col_x(widths)
         cw = self.canvas.winfo_width() or sum(widths)
@@ -273,7 +280,9 @@ class ResultTable(ttk.Frame):
         cv.create_rectangle(0, 0, cw, self.HEADER_H, fill="#eef1f4", outline="")
         for i, (key, title, w, anchor) in enumerate(self.COLUMNS):
             tx, ta = self._anchor_xy(xs[i], widths[i], anchor)
-            cv.create_text(tx, self.HEADER_H // 2, text=title,
+            htitle = self._elide(title, self.font_bold,
+                                 self._cell_avail(widths, i))
+            cv.create_text(tx, self.HEADER_H // 2, text=htitle,
                            font=self.font_bold, fill=C_TEXT, anchor=ta)
             if i:
                 cv.create_line(xs[i], 0, xs[i], self.HEADER_H, fill="#d5d9de")
@@ -292,13 +301,21 @@ class ResultTable(ttk.Frame):
                 cv.create_rectangle(0, y0, cw, y1, fill="#fafbfc", outline="")
 
             ids = []
+            elided: dict[int, str] = {}
             for i, (key, _t, w, anchor) in enumerate(self.COLUMNS):
                 if i == self.delete_col_index:
                     continue                   # 操作列单独画按钮
-                val = str(row.get(key, ""))
+                raw = str(row.get(key, ""))
+                # ★ 像素级截断：超出列宽则显示「头…」，绝不越界压到相邻列
+                is_link = (i == self.link_col_index) and not deleted
+                cfont = self.font_link if is_link else self.font_normal
+                avail = self._cell_avail(widths, i)
+                val = self._elide(raw, cfont, avail)
+                if val != raw:                    # 记录被截断的单元格，供悬停显示全文
+                    elided.setdefault(i, raw)
                 tx, ta = self._anchor_xy(xs[i], w, anchor)
                 # ★ 只有「路径列」用下划线字体（并显示为链接蓝）；已删除行整体置灰
-                if i == self.link_col_index and not deleted:
+                if is_link:
                     fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
                                          font=self.font_link, fill=C_LINK, anchor=ta)
                 else:
@@ -308,6 +325,7 @@ class ResultTable(ttk.Frame):
                 if i:
                     cv.create_line(xs[i], y0, xs[i], y1, fill="#eceff2")
             self.row_items.append(ids)
+            self.elided.append(elided)
             cv.create_line(0, y1, cw, y1, fill="#eceff2")
 
             # ---- 操作列：删除按钮（中性圆角钮 + 柔和投影）---- #
@@ -342,6 +360,37 @@ class ResultTable(ttk.Frame):
         if self.hover_row is not None:
             self._paint_hover(self.hover_row)
 
+    # ---------- 文本省略（像素级） ---------- #
+    def _elide(self, text: str, font, avail: int) -> str:
+        """按像素宽度把 text 截成「头…」形式，保证不超出 avail 像素。
+
+        用 font.measure() 实测宽度而非按字符数估算，中文/英文/全角混排都准确。
+        宽度足够时原样返回，不添加省略号。
+        """
+        if avail <= 0 or not text:
+            return text
+        if font.measure(text) <= avail:
+            return text
+        ell = "…"
+        ew = font.measure(ell)
+        if ew >= avail:
+            return ""
+        lo, hi = 0, len(text)
+        while lo < hi:                            # 二分找最长可容纳前缀
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid]) + ew <= avail:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + ell
+
+    def _cell_avail(self, widths: list[int], i: int) -> int:
+        """单元格可用于文字的像素宽度（扣掉左右内边距）。"""
+        pad = self.PAD
+        if self.COLUMNS[i][3] == "center":
+            pad = 2
+        return max(10, widths[i] - 2 * pad)
+
     def _anchor_xy(self, x, w, anchor):
         if anchor == "center":
             return x + w // 2, "center"
@@ -357,6 +406,38 @@ class ResultTable(ttk.Frame):
             return idx
         return None
 
+    # ---------- 悬浮提示（仅被截断的单元格） ---------- #
+    def _cell_col_at(self, x: int, widths: list[int], xs: list[int]) -> int | None:
+        """x 像素落在哪一列（排除「操作」列）。"""
+        for i in range(len(widths)):
+            if i == self.delete_col_index:
+                continue
+            if xs[i] <= x <= xs[i] + widths[i]:
+                return i
+        return None
+
+    def _show_tip(self, row: int, col: int, text: str, x_root: int, y_root: int):
+        if self.tip_win is None:
+            self.tip_win = Toplevel(self)
+            self.tip_win.wm_overrideredirect(True)     # 无边框
+            self.tip_win.attributes("-topmost", True)
+            self.tip_text = Label(
+                self.tip_win, text=text, justify="left",
+                background="#1f2937", foreground="#f9fafb",
+                font=("Microsoft YaHei UI", 9),
+                relief="solid", borderwidth=1, padx=8, pady=4,
+                wraplength=640)
+            self.tip_text.pack()
+        self.tip_text.config(text=text)
+        self.tip_win.wm_geometry(f"+{x_root + 14}+{y_root + 20}")
+        self.tip_win.deiconify()
+        self.tip_row = (row, col)
+
+    def _hide_tip(self):
+        if self.tip_win is not None:
+            self.tip_win.withdraw()
+        self.tip_row = None
+
     def _on_motion(self, event):
         row = self._row_at(event.y)
         if row != self.hover_row:
@@ -366,7 +447,24 @@ class ResultTable(ttk.Frame):
                 self._unpaint_hover(old)
             if row is not None:
                 self._paint_hover(row)
+            if row is None:
+                self._hide_tip()
         self._hover_button(event, row)
+
+        # ---- 悬浮提示：仅当该单元格文字被截断时显示完整内容 ----
+        if row is None:
+            self._hide_tip()
+        else:
+            widths = self._col_widths()
+            xs = self._col_x(widths)
+            col = self._cell_col_at(event.x, widths, xs)
+            full = self.elided[row].get(col) if row < len(self.elided) else None
+            if full is None:
+                self._hide_tip()
+            elif self.tip_row != (row, col):
+                self._show_tip(row, col, full,
+                               self.canvas.winfo_rootx() + event.x,
+                               self.canvas.winfo_rooty() + event.y)
 
     def _hover_button(self, event, row):
         """删除按钮悬停：浅红底提示「删除」+ 手型光标（已删除行除外）。"""
@@ -409,6 +507,7 @@ class ResultTable(ttk.Frame):
         if self.hover_row is not None:
             self._unpaint_hover(self.hover_row)
             self.hover_row = None
+        self._hide_tip()
 
     def _paint_hover(self, row: int):
         """高亮该行的路径列（下划线更明显，提示可点击）。已删除行不参与。"""
@@ -441,6 +540,7 @@ class ResultTable(ttk.Frame):
 
     def _on_click(self, event):
         """单击：点在路径列 → 播放；点在「删除」按钮 → 触发删除回调。"""
+        self._hide_tip()
         row_idx = self._row_at(event.y)
         if row_idx is None:
             return
