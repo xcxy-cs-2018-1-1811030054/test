@@ -41,7 +41,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PurePath
 from tkinter import (BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, IntVar,
                      Label, StringVar, Tk, Toplevel, filedialog, messagebox)
 from tkinter import font as tkfont
@@ -63,7 +63,7 @@ except Exception:                                   # noqa: BLE001
 # --------------------------------------------------------------------------- #
 
 APP_NAME = "视频去重工具"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -146,10 +146,9 @@ class ResultTable(ttk.Frame):
     COLUMNS = [
         ("group", "组", 48, "center"),
         ("action", "处理", 70, "center"),
-        ("name", "文件名", 230, "w"),
+        ("name", "文件名（单击播放）", 400, "w"),
         ("quality", "清晰度", 140, "w"),
         ("size", "大小", 85, "e"),
-        ("path", "路径（单击播放）", 400, "w"),
         ("delete", "操作", 76, "center"),
     ]
     HEADER_H = 30
@@ -170,9 +169,10 @@ class ResultTable(ttk.Frame):
         self.on_link_click = on_link_click      # 回调：点击「链接列」时触发
         self.on_delete_click = on_delete_click  # 回调：点击「删除」按钮时触发
         # 按键定位各特殊列（避免依赖固定顺序）
-        self.link_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "path")
+        # ★ 「文件名」列即可点击的链接列（原 path 列已移除，链接职能并入文件名）
+        self.link_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "name")
         self.delete_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "delete")
-        self.name_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "name")
+        self.name_col_index = self.link_col_index
 
         self.rows: list[dict] = []              # 每行数据
         self.row_items: list[list[int]] = []    # 每行对应的 canvas item id
@@ -195,7 +195,9 @@ class ResultTable(ttk.Frame):
 
         self.font_normal = tkfont.Font(family="Microsoft YaHei UI", size=9)
         self.font_bold = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
-        self.font_link = tkfont.Font(family="Microsoft YaHei UI", size=9, underline=True)
+        # 链接列（文件名）不再使用下划线/蓝色，外观与普通文本一致；
+        # 保留该字体对象仅为兼容旧引用，实为普通字体
+        self.font_link = self.font_normal
 
         # 画布 + 滚动条
         self.canvas = Canvas(self, bg=C_CARD, highlightthickness=0)
@@ -236,9 +238,11 @@ class ResultTable(ttk.Frame):
     def _col_widths(self) -> list[int]:
         """计算各列实际宽度。
 
-        其余列宽固定不变；画布比列宽总和多出来的空间，
-        由「文件名」与「路径」列平分（余数给路径列，保证总和精确填满）。
-        窗口拉窄时，先让这两列收缩但不低于各自下限；仍装不下才整体等比压缩，
+        其余列宽固定不变；画布比列宽总和多出来的空间，全部给可伸缩列
+        （当前只有「文件名」列 —— 原「路径」列已移除，链接职能并入文件名）。
+        若将来重新引入第二列可伸缩列（如恢复独立路径列），这里的 flex
+        列表会自动让两列平分空间，无需改动其余逻辑。
+        窗口拉窄时，先让伸缩列收缩但不低于其下限；仍装不下才整体等比压缩，
         确保任何宽度下都不会画出画布边界。
         """
         widths = [c[2] for c in self.COLUMNS]
@@ -246,18 +250,19 @@ class ResultTable(ttk.Frame):
         if cw <= 10:
             return widths
 
-        flex = [self.name_col_index, self.link_col_index]   # 可伸缩的两列
+        # 可伸缩列（去重，避免同一列被计入两次）
+        flex = list(dict.fromkeys([self.name_col_index, self.link_col_index]))
         total = sum(widths)
         extra = cw - total
 
         if extra >= 0:
-            # 多余空间平分给「文件名」与「路径」，余数给路径列
+            # 多余空间在伸缩列间平分，余数给最后一列（保证总和精确填满）
             half, rem = divmod(extra, len(flex))
             for k, ci in enumerate(flex):
                 widths[ci] += half + (rem if k == len(flex) - 1 else 0)
             return widths
 
-        # ---- 空间不足：先只压缩这两列，不低于各自下限（基础宽的一半）----
+        # ---- 空间不足：先只压缩伸缩列，不低于各自下限（基础宽的一半）----
         floors = {ci: max(120, self.COLUMNS[ci][2] // 2) for ci in flex}
         shrink = -extra
         for ci in flex:
@@ -350,20 +355,14 @@ class ResultTable(ttk.Frame):
                     continue                   # 操作列单独画按钮
                 raw = str(row.get(key, ""))
                 # ★ 像素级截断：超出列宽则显示「头…」，绝不越界压到相邻列
-                is_link = (i == self.link_col_index) and not deleted
-                cfont = self.font_link if is_link else self.font_normal
                 avail = self._cell_avail(widths, i)
-                val = self._elide(raw, cfont, avail)
+                val = self._elide(raw, self.font_normal, avail)
                 if val != raw:                    # 记录被截断的单元格，供悬停显示全文
                     elided.setdefault(i, raw)
                 tx, ta = self._anchor_xy(xs[i], w, anchor)
-                # ★ 只有「路径列」用下划线字体（并显示为链接蓝）；已删除行整体置灰
-                if is_link:
-                    fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
-                                         font=self.font_link, fill=C_LINK, anchor=ta)
-                else:
-                    fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
-                                         font=self.font_normal, fill=fg, anchor=ta)
+                # ★ 文件名列虽可点击，但外观与普通文本一致（无蓝色、无下划线）
+                fid = cv.create_text(tx, (y0 + y1) // 2, text=val,
+                                     font=self.font_normal, fill=fg, anchor=ta)
                 ids.append(fid)
                 if i:
                     cv.create_line(xs[i], y0, xs[i], y1, fill="#eceff2")
@@ -494,20 +493,35 @@ class ResultTable(ttk.Frame):
                 self._hide_tip()
         self._hover_button(event, row)
 
-        # ---- 悬浮提示：仅当该单元格文字被截断时显示完整内容 ----
+        # ---- 悬浮提示 ----
+        # 文件名列：始终显示「所在目录 + 完整文件名」（路径列已移除，这里承载位置信息）
+        # 其它列：仅当文字被截断时显示完整内容
         if row is None:
             self._hide_tip()
         else:
             widths = self._col_widths()
             xs = self._col_x(widths)
             col = self._cell_col_at(event.x, widths, xs)
-            full = self.elided[row].get(col) if row < len(self.elided) else None
-            if full is None:
+            text = None
+            if col == self.link_col_index:
+                text = self._name_tip(self.rows[row])
+            elif row < len(self.elided):
+                text = self.elided[row].get(col)
+            if not text:
                 self._hide_tip()
             elif self.tip_row != (row, col):
-                self._show_tip(row, col, full,
+                self._show_tip(row, col, text,
                                self.canvas.winfo_rootx() + event.x,
                                self.canvas.winfo_rooty() + event.y)
+
+    def _name_tip(self, row: dict) -> str:
+        """文件名列的悬浮内容：目录 + 完整文件名（目录缺失时只给文件名）。"""
+        name = str(row.get("name", ""))
+        rel = str(row.get("path", ""))
+        d = str(PurePath(rel).parent) if rel else ""
+        if d in ("", "."):
+            return name
+        return f"{name}\n\n所在目录：{d}"
 
     def _hover_button(self, event, row):
         """删除按钮悬停：浅红底提示「删除」+ 手型光标（已删除行除外）。"""
@@ -530,7 +544,7 @@ class ResultTable(ttk.Frame):
             self._hover_btn_row = row
             self.canvas.config(cursor="hand2")
         else:
-            # 路径列也用手型光标（已删除行除外）
+            # 文件名列也可点击播放 → 手型光标（已删除行除外）
             widths = self._col_widths()
             xs = self._col_x(widths)
             li = self.link_col_index
@@ -553,36 +567,18 @@ class ResultTable(ttk.Frame):
         self._hide_tip()
 
     def _paint_hover(self, row: int):
-        """高亮该行的路径列（下划线更明显，提示可点击）。已删除行不参与。"""
-        if self.rows[row].get("deleted"):
-            return
-        try:
-            fid = self.row_items[row][self.link_col_index]
-            self.canvas.itemconfigure(fid, fill=C_PRIMARY)
-            # 补一条下划横线，强化链接感
-            widths = self._col_widths()
-            xs = self._col_x(widths)
-            y = self.HEADER_H + row * self.ROW_H + self.ROW_H - 6
-            line = self.canvas.create_line(
-                xs[self.link_col_index] + self.PAD, y,
-                xs[self.link_col_index] + widths[self.link_col_index] - self.PAD, y,
-                fill=C_PRIMARY, width=2, tags=f"hoverline{row}")
-        except IndexError:
-            pass
+        """悬停高亮：仅记录状态，不改文字颜色（保持普通文本外观）。
+
+        可点击的提示交给光标形状（手型）承担，避免蓝色/下划线改变排版观感。
+        """
+        return
 
     def _unpaint_hover(self, row: int):
-        try:
-            fid = self.row_items[row][self.link_col_index]
-            deleted = self.rows[row].get("deleted")
-            # 已删除行 → 恢复为灰色普通文本；正常行 → 恢复为链接蓝
-            self.canvas.itemconfigure(
-                fid, fill=self.C_DELETED if deleted else C_LINK)
-            self.canvas.delete(f"hoverline{row}")
-        except IndexError:
-            pass
+        """与 _paint_hover 对称：无需恢复任何颜色。"""
+        return
 
     def _on_click(self, event):
-        """单击：点在路径列 → 播放；点在「删除」按钮 → 触发删除回调。"""
+        """单击：点在文件名列 → 播放；点在「删除」按钮 → 触发删除回调。"""
         self._hide_tip()
         row_idx = self._row_at(event.y)
         if row_idx is None:
@@ -600,7 +596,7 @@ class ResultTable(ttk.Frame):
                     self.on_delete_click(self.rows[row_idx], row_idx)
                 return
 
-        # 2) 路径链接（已删除行不可点击播放）
+        # 2) 文件名链接（已删除行不可点击播放）
         if self.rows[row_idx].get("deleted"):
             return
         li = self.link_col_index
@@ -1472,9 +1468,15 @@ class VideoDedupApp:
             for p in ordered:
                 try:
                     size = human_size(p.stat().st_size)
-                    rel = str(p.relative_to(root)) if root else str(p)
+                except OSError:
+                    size = "?"
+                # 归一化后再取相对路径：p 来自 glob（可能未 resolve），
+                # 而 root 是 resolve 过的，直接 relative_to 可能抛 ValueError
+                try:
+                    pr = p.resolve()
+                    rel = str(pr.relative_to(root)) if root else str(pr)
                 except (OSError, ValueError):
-                    size, rel = "?", str(p)
+                    rel = str(p)
                 is_keep = (p == keeper)
                 rows.append({
                     "group": i,
