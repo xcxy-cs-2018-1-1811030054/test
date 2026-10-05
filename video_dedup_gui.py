@@ -63,7 +63,7 @@ except Exception:                                   # noqa: BLE001
 # --------------------------------------------------------------------------- #
 
 APP_NAME = "视频去重工具"
-APP_VERSION = "2.9"
+APP_VERSION = "3.0"
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -172,6 +172,7 @@ class ResultTable(ttk.Frame):
         # 按键定位各特殊列（避免依赖固定顺序）
         self.link_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "path")
         self.delete_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "delete")
+        self.name_col_index = next(i for i, c in enumerate(self.COLUMNS) if c[0] == "name")
 
         self.rows: list[dict] = []              # 每行数据
         self.row_items: list[list[int]] = []    # 每行对应的 canvas item id
@@ -233,18 +234,60 @@ class ResultTable(ttk.Frame):
 
     # ---------- 列宽 ---------- #
     def _col_widths(self) -> list[int]:
+        """计算各列实际宽度。
+
+        其余列宽固定不变；画布比列宽总和多出来的空间，
+        由「文件名」与「路径」列平分（余数给路径列，保证总和精确填满）。
+        窗口拉窄时，先让这两列收缩但不低于各自下限；仍装不下才整体等比压缩，
+        确保任何宽度下都不会画出画布边界。
+        """
         widths = [c[2] for c in self.COLUMNS]
         cw = self.canvas.winfo_width()
-        if cw > 10:
-            total = sum(widths)
-            extra = cw - total
-            if extra > 0:
-                # 多余宽度给「路径」列（而非最后一列）
-                widths[self.link_col_index] += extra
-            else:
-                # 空间不足时按比例压缩
-                scale = cw / total
-                widths = [max(40, int(w * scale)) for w in widths]
+        if cw <= 10:
+            return widths
+
+        flex = [self.name_col_index, self.link_col_index]   # 可伸缩的两列
+        total = sum(widths)
+        extra = cw - total
+
+        if extra >= 0:
+            # 多余空间平分给「文件名」与「路径」，余数给路径列
+            half, rem = divmod(extra, len(flex))
+            for k, ci in enumerate(flex):
+                widths[ci] += half + (rem if k == len(flex) - 1 else 0)
+            return widths
+
+        # ---- 空间不足：先只压缩这两列，不低于各自下限（基础宽的一半）----
+        floors = {ci: max(120, self.COLUMNS[ci][2] // 2) for ci in flex}
+        shrink = -extra
+        for ci in flex:
+            take = min(shrink, widths[ci] - floors[ci])
+            if take > 0:
+                widths[ci] -= take
+                shrink -= take
+        if shrink <= 0:
+            return widths
+
+        # ---- 仍装不下：整体等比压缩（含固定列），恰好收进画布 ----
+        min_total = 30 * len(widths)              # 每列最小 30px 的物理下限
+        if cw < min_total:
+            # 画布比「所有列的最小宽之和」还窄，无法既填满又不丢列；
+            # 此时退回统一最小宽（宁可留白也不越界）。窗口有 minsize 限制，实际不会走到。
+            return [30] * len(widths)
+        scale = cw / float(sum(widths))
+        widths = [max(30, int(w * scale)) for w in widths]
+        # int() 截断会累积误差（最多 len-1 像素），这里精确补齐：
+        #   超出 → 从最宽的列依次扣；欠填 → 余数补给「路径」列（最宽且最需要空间）
+        delta = sum(widths) - cw
+        if delta > 0:
+            for i in sorted(range(len(widths)), key=lambda i: widths[i], reverse=True):
+                if delta <= 0:
+                    break
+                take = min(delta, widths[i] - 30)
+                widths[i] -= take
+                delta -= take
+        elif delta < 0:
+            widths[self.link_col_index] -= delta        # delta 为负 → 实际是加上
         return widths
 
     def _col_x(self, widths: list[int]) -> list[int]:
