@@ -63,7 +63,7 @@ except Exception:                                   # noqa: BLE001
 # --------------------------------------------------------------------------- #
 
 APP_NAME = "视频去重工具"
-APP_VERSION = "2.6"
+APP_VERSION = "2.8"
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -1047,6 +1047,13 @@ class VideoDedupApp:
                         font=("Microsoft YaHei UI", 9))
         style.configure("TButton", font=("Microsoft YaHei UI", 10))
         style.configure("Primary.TButton", font=("Microsoft YaHei UI", 11, "bold"))
+        # 「一键删除」危险按钮：红底白字，悬停加深
+        style.configure("Danger.TButton", font=("Microsoft YaHei UI", 11, "bold"),
+                        background=C_DANGER, foreground="white", borderwidth=0,
+                        focuscolor=C_DANGER, padding=(10, 4))
+        style.map("Danger.TButton",
+                  background=[("active", "#b91c1c"), ("disabled", "#f3b4b4")],
+                  foreground=[("disabled", "#ffe4e4")])
         style.configure("TCheckbutton", background=C_BG, foreground=C_TEXT,
                         font=("Microsoft YaHei UI", 10))
         style.configure("Card.TCheckbutton", background=C_CARD, foreground=C_TEXT,
@@ -1163,12 +1170,15 @@ class VideoDedupApp:
         # ---- 操作 ----
         brow = ttk.Frame(outer)
         brow.pack(fill=X, pady=(12, 0))
+        self.brow = brow                       # 供「一键删除」按钮动态挂载
         self.btn_scan = ttk.Button(brow, text="开始扫描", style="Primary.TButton",
                                    command=self.on_scan)
         self.btn_scan.pack(side=LEFT, ipadx=20, ipady=6)
         self.btn_cancel = ttk.Button(brow, text="停止", command=self.on_cancel,
                                      state="disabled")
         self.btn_cancel.pack(side=LEFT, padx=(10, 0), ipady=6)
+        # 「一键删除」：仅在「预演」模式下扫描出重复行后才创建并显示
+        self.btn_bulk = None
         ttk.Label(brow, text="  提示：单击蓝色路径播放视频；点「删除」按钮立即删除该文件",
                   style="Muted.TLabel").pack(side=LEFT, padx=(12, 0))
 
@@ -1333,6 +1343,71 @@ class VideoDedupApp:
                     "is_keep": is_keep,
                 })
         self.table.set_rows(rows)
+        # 预演模式下且确有重复行 → 显示「一键删除」
+        self._update_bulk_button()
+
+    # ---------------- 一键删除 ---------------- #
+    def _dup_rows(self) -> list[dict]:
+        """当前结果中所有仍待处理的「重复」行。"""
+        return [r for r in self.table.rows
+                if r.get("action") == "重复" and not r.get("deleted")]
+
+    def _update_bulk_button(self):
+        """按条件显示/隐藏「一键删除」按钮：仅预演模式 + 存在重复行。"""
+        show = self.dry_run.get() and bool(self._dup_rows())
+        if show and self.btn_bulk is None:
+            self.btn_bulk = ttk.Button(self.brow, text="一键删除全部重复",
+                                       style="Danger.TButton",
+                                       command=self.on_bulk_delete)
+        if self.btn_bulk is None:
+            return
+        if show:
+            if not self.btn_bulk.winfo_manager():
+                self.btn_bulk.pack(side=LEFT, padx=(10, 0), ipady=6)
+        else:
+            self.btn_bulk.pack_forget()
+
+    def _hide_bulk_button(self):
+        if self.btn_bulk is not None:
+            self.btn_bulk.pack_forget()
+
+    def on_bulk_delete(self):
+        """删除当前结果中所有「重复」行对应的文件（保留行不动）。"""
+        dups = self._dup_rows()
+        if not dups:
+            return
+        if not messagebox.askyesno(
+                "一键删除",
+                f"将删除 {len(dups)} 个「重复」文件，保留每组的保留项。\n"
+                "此操作不可恢复，确定继续吗？", icon="warning"):
+            return
+
+        deleted = failed = 0
+        for row in dups:
+            rel = row.get("path", "")
+            if not rel or not self.scan_root:
+                continue
+            target = self.scan_root / rel
+            try:
+                if target.exists():
+                    target.unlink()
+                row["deleted"] = True
+                row["action"] = "已删除"
+                deleted += 1
+                self.log(f"🗑 已删除：{target}")
+            except OSError as e:
+                failed += 1
+                self.log(f"  [失败] {target}: {e}")
+
+        self.table.set_rows(self.table.rows)        # 重绘：已删除行置灰
+        self._update_bulk_button()                  # 重复行清空后按钮自动隐藏
+        msg = f"已删除 {deleted} 个重复文件"
+        if failed:
+            msg += f"（{failed} 个失败，详见日志）"
+        self.summary.config(text=msg)
+        self.log("=" * 64)
+        self.log(f"一键删除完成：成功 {deleted} 个"
+                 + (f"，失败 {failed} 个" if failed else ""))
 
     # ---------------- 扫描 ---------------- #
     def on_scan(self):
@@ -1361,35 +1436,51 @@ class VideoDedupApp:
         self.btn_cancel.config(state="normal")
         self.log_box.delete("1.0", END)
         self.table.clear()
+        self._hide_bulk_button()
         self.summary.config(text="")
 
-        self.worker = threading.Thread(target=self._run_scan, args=(root,), daemon=True)
+        # ★ 主线程先把全部选项快照成普通值再传给工作线程：
+        #   tkinter 变量禁止跨线程访问，工作线程里调 .get() 会抛
+        #   RuntimeError(main thread is not in main loop)，
+        #   导致扫描中断、文件未被删除（本 bug 根因）
+        opts = {
+            "recursive": self.recursive.get(),
+            "dry_run": self.dry_run.get(),
+            "permanent": self.permanent.get(),
+            "keep": self.keep.get(),
+            "use_frame": self.use_frame.get(),
+            "threshold": self.threshold.get(),
+            "dur_check": self.dur_check.get(),
+            "dur_tol": self._dur_tol(),
+            "use_align": self.use_align.get(),
+        }
+        self.worker = threading.Thread(target=self._run_scan, args=(root, opts), daemon=True)
         self.worker.start()
 
     def on_cancel(self):
         self.cancel_flag.set()
         self.log("⚠ 用户请求停止…")
 
-    def _run_scan(self, root: Path):
+    def _run_scan(self, root: Path, opts: dict):
         try:
             t0 = time.time()
             self.log("=" * 64)
             self.log(f"扫描目录：{root}")
-            mode = "预演" if self.dry_run.get() else (
-                "永久删除" if self.permanent.get() else "移动到 _duplicates/")
-            self.log(f"递归：{'是' if self.recursive.get() else '否'}   "
-                     f"模式：{mode}   保留规则：{self.keep.get()}")
-            frame_desc = f"画面查重：{'开启' if self.use_frame.get() else '关闭'}"
-            if self.use_frame.get():
-                frame_desc += f"（阈值 {self.threshold.get()}"
-                if self.dur_check.get():
-                    frame_desc += f" | A时长校验±{self._dur_tol()}s"
-                frame_desc += f" | B时间轴对齐{'开' if self.use_align.get() else '关'}）"
+            mode = "预演" if opts["dry_run"] else (
+                "永久删除" if opts["permanent"] else "移动到 _duplicates/")
+            self.log(f"递归：{'是' if opts['recursive'] else '否'}   "
+                     f"模式：{mode}   保留规则：{opts['keep']}")
+            frame_desc = f"画面查重：{'开启' if opts['use_frame'] else '关闭'}"
+            if opts["use_frame"]:
+                frame_desc += f"（阈值 {opts['threshold']}"
+                if opts["dur_check"]:
+                    frame_desc += f" | A时长校验±{opts['dur_tol']}s"
+                frame_desc += f" | B时间轴对齐{'开' if opts['use_align'] else '关'}）"
             self.log(frame_desc)
             self.log("=" * 64)
 
             self.progress(0, 1, "枚举文件")
-            files = iter_video_files(root, self.recursive.get())
+            files = iter_video_files(root, opts["recursive"])
             total_size = sum(f.stat().st_size for f in files)
             self.log(f"发现 {len(files)} 个视频文件，合计 {human_size(total_size)}")
             if len(files) < 2:
@@ -1407,12 +1498,12 @@ class VideoDedupApp:
 
             # 第二级：画面级
             frame_groups = []
-            if self.use_frame.get():
+            if opts["use_frame"]:
                 frame_groups = engine.find_similar_by_frames(
-                    files, self.threshold.get(), self.info_map,
-                    use_align=self.use_align.get(),
-                    duration_on=self.dur_check.get(),
-                    duration_tol=self._dur_tol())
+                    files, opts["threshold"], self.info_map,
+                    use_align=opts["use_align"],
+                    duration_on=opts["dur_check"],
+                    duration_tol=opts["dur_tol"])
                 if self.cancel_flag.is_set():
                     self.msg_queue.put(("done", "已停止，未做任何改动。"))
                     return
@@ -1440,7 +1531,7 @@ class VideoDedupApp:
             for group in groups:
                 if self.cancel_flag.is_set():
                     break
-                keeper = choose_keeper(group, self.info_map, self.keep.get())
+                keeper = choose_keeper(group, self.info_map, opts["keep"])
                 others = [p for p in group if p != keeper]
                 try:
                     saved += sum(p.stat().st_size for p in others)
@@ -1448,10 +1539,10 @@ class VideoDedupApp:
                     pass
                 for p in others:
                     dup_count += 1
-                    if self.dry_run.get():
+                    if opts["dry_run"]:
                         continue
                     try:
-                        if self.permanent.get():
+                        if opts["permanent"]:
                             p.unlink()
                         else:
                             dup_dir.mkdir(exist_ok=True)
@@ -1472,10 +1563,10 @@ class VideoDedupApp:
             self.log(f"可释放空间：{human_size(saved)}")
             self.log(f"耗时：{elapsed:.1f} 秒")
 
-            if self.dry_run.get():
+            if opts["dry_run"]:
                 s = (f"预演完成：{len(groups)} 组重复，可清理 {dup_count} 个文件，"
                      f"释放 {human_size(saved)}（未修改任何文件）")
-            elif self.permanent.get():
+            elif opts["permanent"]:
                 s = (f"完成：已永久删除 {dup_count} 个重复文件，释放 {human_size(saved)}"
                      + (f"（{failed} 个失败）" if failed else ""))
             else:
